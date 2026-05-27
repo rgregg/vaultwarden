@@ -265,7 +265,7 @@ async fn sso_login(
 
     let now = Utc::now().naive_utc();
     // Will trigger 2FA flow if needed
-    let (user, mut device, twofactor_token, sso_user) = match user_with_sso {
+    let (mut user, mut device, twofactor_token, sso_user) = match user_with_sso {
         None => {
             if !CONFIG.is_email_domain_allowed(&user_infos.email) {
                 err!(
@@ -342,6 +342,15 @@ async fn sso_login(
     // We passed 2FA get auth tokens
     let auth_tokens = sso::redeem(&device, &user, data.client_id, sso_user, sso_auth, user_infos, conn).await?;
 
+    // Bootstrap Key Connector designation from the config allowlist on SSO login.
+    if !CONFIG.sso_key_connector_url().is_empty()
+        && CONFIG.is_sso_key_connector_user(&user.email)
+        && !user.uses_key_connector
+    {
+        user.uses_key_connector = true;
+        user.save(conn).await?;
+    }
+
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
 }
 
@@ -372,6 +381,16 @@ async fn password_login(
         err!(
             "This user has been disabled",
             format!("IP: {}. Username: {username}.", ip.ip),
+            ErrorEvent {
+                event: EventType::UserFailedLogIn
+            }
+        )
+    }
+
+    // Key Connector users must authenticate via SSO, not password.
+    if is_key_connector_user(user.uses_key_connector, &user.email) {
+        err!(
+            "This account uses Key Connector and must sign in via SSO",
             ErrorEvent {
                 event: EventType::UserFailedLogIn
             }
@@ -501,24 +520,7 @@ async fn authenticated_response(
 
     let master_password_policy = master_password_policy(user, conn).await;
 
-    let has_master_password = !user.password_hash.is_empty();
-    let master_password_unlock = if has_master_password {
-        json!({
-            "Kdf": {
-                "KdfType": user.client_kdf_type,
-                "Iterations": user.client_kdf_iter,
-                "Memory": user.client_kdf_memory,
-                "Parallelism": user.client_kdf_parallelism
-            },
-            // This field is named inconsistently and will be removed and replaced by the "wrapped" variant in the apps.
-            // https://github.com/bitwarden/android/blob/release/2025.12-rc41/network/src/main/kotlin/com/bitwarden/network/model/MasterPasswordUnlockDataJson.kt#L22-L26
-            "MasterKeyEncryptedUserKey": user.akey,
-            "MasterKeyWrappedUserKey": user.akey,
-            "Salt": user.email
-        })
-    } else {
-        Value::Null
-    };
+    let user_decryption_options = build_user_decryption_options(user);
 
     let account_keys = if user.private_key.is_some() {
         json!({
@@ -548,11 +550,7 @@ async fn authenticated_response(
         "MasterPasswordPolicy": master_password_policy,
         "scope": auth_tokens.scope(),
         "AccountKeys": account_keys,
-        "UserDecryptionOptions": {
-            "HasMasterPassword": has_master_password,
-            "MasterPasswordUnlock": master_password_unlock,
-            "Object": "userDecryptionOptions"
-        },
+        "UserDecryptionOptions": user_decryption_options,
     });
 
     if !user.akey.is_empty() {
@@ -652,25 +650,6 @@ async fn user_api_key_login(
 
     info!("User {} logged in successfully via API key. IP: {}", user.email, ip.ip);
 
-    let has_master_password = !user.password_hash.is_empty();
-    let master_password_unlock = if has_master_password {
-        json!({
-            "Kdf": {
-                "KdfType": user.client_kdf_type,
-                "Iterations": user.client_kdf_iter,
-                "Memory": user.client_kdf_memory,
-                "Parallelism": user.client_kdf_parallelism
-            },
-            // This field is named inconsistently and will be removed and replaced by the "wrapped" variant in the apps.
-            // https://github.com/bitwarden/android/blob/release/2025.12-rc41/network/src/main/kotlin/com/bitwarden/network/model/MasterPasswordUnlockDataJson.kt#L22-L26
-            "MasterKeyEncryptedUserKey": user.akey,
-            "MasterKeyWrappedUserKey": user.akey,
-            "Salt": user.email
-        })
-    } else {
-        Value::Null
-    };
-
     let account_keys = if user.private_key.is_some() {
         json!({
             "publicKeyEncryptionKeyPair": {
@@ -701,11 +680,7 @@ async fn user_api_key_login(
         "ForcePasswordReset": false,
         "scope": AuthMethod::UserApiKey.scope(),
         "AccountKeys": account_keys,
-        "UserDecryptionOptions": {
-            "HasMasterPassword": has_master_password,
-            "MasterPasswordUnlock": master_password_unlock,
-            "Object": "userDecryptionOptions"
-        },
+        "UserDecryptionOptions": build_user_decryption_options(&user),
     });
 
     Ok(Json(result))
@@ -1302,4 +1277,82 @@ async fn authorize(data: AuthorizeData, cookies: &CookieJar<'_>, secure: Secure,
     );
 
     Ok(Redirect::temporary(String::from(auth_url)))
+}
+
+/// Build the `UserDecryptionOptions` object for a login response. Key Connector
+/// users get a KeyConnectorOption and never a MasterPasswordUnlock (never-both invariant).
+fn build_user_decryption_options(user: &User) -> Value {
+    let is_kc_user = is_key_connector_user(user.uses_key_connector, &user.email);
+    let has_master_password = !is_kc_user && !user.password_hash.is_empty();
+    let master_password_unlock = if has_master_password {
+        json!({
+            "Kdf": {
+                "KdfType": user.client_kdf_type,
+                "Iterations": user.client_kdf_iter,
+                "Memory": user.client_kdf_memory,
+                "Parallelism": user.client_kdf_parallelism
+            },
+            "MasterKeyEncryptedUserKey": user.akey,
+            "MasterKeyWrappedUserKey": user.akey,
+            "Salt": user.email
+        })
+    } else {
+        Value::Null
+    };
+    let mut udo = json!({
+        "HasMasterPassword": has_master_password,
+        "MasterPasswordUnlock": master_password_unlock,
+        "Object": "userDecryptionOptions"
+    });
+    if is_kc_user {
+        udo["KeyConnectorOption"] = json!({ "KeyConnectorUrl": CONFIG.sso_key_connector_url() });
+    }
+    udo
+}
+
+/// Decide whether this user is a Key Connector user for the login response.
+/// Requires a configured connector URL AND either the persisted flag or
+/// allowlist membership. Key Connector users never get master-password unlock data.
+fn is_key_connector_user(uses_key_connector_flag: bool, email: &str) -> bool {
+    is_key_connector_user_inner(uses_key_connector_flag, email, &CONFIG.sso_key_connector_url(), |e| {
+        CONFIG.is_sso_key_connector_user(e)
+    })
+}
+
+/// Pure inner logic for `is_key_connector_user`, separated to allow unit testing without CONFIG.
+fn is_key_connector_user_inner(
+    uses_key_connector_flag: bool,
+    email: &str,
+    connector_url: &str,
+    is_allowlisted: impl Fn(&str) -> bool,
+) -> bool {
+    if connector_url.is_empty() {
+        return false;
+    }
+    uses_key_connector_flag || is_allowlisted(email)
+}
+
+#[cfg(test)]
+mod kc_tests {
+    #[test]
+    fn no_connector_url_means_not_kc() {
+        // With no SSO_KEY_CONNECTOR_URL configured (empty string), even a
+        // flagged user must not be treated as a Key Connector user.
+        assert!(!super::is_key_connector_user_inner(true, "anyone@example.com", "", |_| false));
+    }
+
+    #[test]
+    fn flag_with_url_is_kc() {
+        assert!(super::is_key_connector_user_inner(true, "anyone@example.com", "https://kc.example.com", |_| false));
+    }
+
+    #[test]
+    fn allowlist_with_url_is_kc() {
+        assert!(super::is_key_connector_user_inner(false, "kc@example.com", "https://kc.example.com", |_| true));
+    }
+
+    #[test]
+    fn no_flag_no_allowlist_with_url_is_not_kc() {
+        assert!(!super::is_key_connector_user_inner(false, "other@example.com", "https://kc.example.com", |_| false));
+    }
 }

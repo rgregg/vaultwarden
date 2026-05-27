@@ -811,6 +811,10 @@ make_config! {
         sso_client_secret:              Pass,   true,   def,    String::new();
         /// Authority Server |> Base url of the OIDC provider discovery endpoint (without `/.well-known/openid-configuration`)
         sso_authority:                  String, true,   def,    String::new();
+        /// Key Connector URL |> Base URL of the Key Connector service for master-password-free SSO
+        sso_key_connector_url:          String, true,   def,    String::new();
+        /// Key Connector users |> Comma-separated list of emails that use Key Connector instead of a master password
+        sso_key_connector_users:        String, true,   def,    String::new();
         /// Authorization request scopes |> List the of the needed scope (`openid` is implicit)
         sso_scopes:                     String, true,  def,   "email profile".to_owned();
         /// Authorization request extra parameters
@@ -1657,6 +1661,53 @@ impl Config {
 
     pub fn sso_authorize_extra_params_vec(&self) -> Vec<(String, String)> {
         url::form_urlencoded::parse(self.sso_authorize_extra_params().as_bytes()).into_owned().collect()
+    }
+
+    /// True if the given email is configured as a Key Connector user.
+    pub fn is_sso_key_connector_user(&self, email: &str) -> bool {
+        email_in_allowlist(&self.sso_key_connector_users(), email)
+    }
+}
+
+/// True if `email` (case-insensitive) appears in a comma-separated allowlist.
+fn email_in_allowlist(list: &str, email: &str) -> bool {
+    let email = email.trim().to_lowercase();
+    !email.is_empty() && list.split(',').map(|e| e.trim().to_lowercase()).any(|e| !e.is_empty() && e == email)
+}
+
+#[cfg(test)]
+mod email_allowlist_tests {
+    use super::email_in_allowlist;
+
+    #[test]
+    fn basic_membership() {
+        assert!(email_in_allowlist("a@x.com,b@y.com", "b@y.com"));
+        assert!(!email_in_allowlist("a@x.com,b@y.com", "c@z.com"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(email_in_allowlist("A@X.com", "a@x.com"));
+        assert!(email_in_allowlist("a@x.com", "A@X.COM"));
+    }
+
+    #[test]
+    fn whitespace_tolerant() {
+        assert!(email_in_allowlist(" a@x.com , b@y.com ", "b@y.com"));
+        assert!(email_in_allowlist("a@x.com", " a@x.com "));
+    }
+
+    #[test]
+    fn empty_list_or_email() {
+        assert!(!email_in_allowlist("", "a@x.com"));
+        assert!(!email_in_allowlist("a@x.com", ""));
+        assert!(!email_in_allowlist("", ""));
+    }
+
+    #[test]
+    fn no_substring_or_prefix_match() {
+        assert!(!email_in_allowlist("alice@x.com", "ali@x.com"));
+        assert!(!email_in_allowlist("alice@x.com", "@x.com"));
     }
 }
 
